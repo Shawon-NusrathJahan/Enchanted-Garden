@@ -1,8 +1,9 @@
 #ifndef MOUNTAIN_H
 #define MOUNTAIN_H
 
-// Draws the complete valley scene. zoom controls the forward journey;
-// parallax controls the relative movement of depth layers.
-void drawMountains(float zoom, float parallax);
+#include "animation.h"
+
+void initMountain();                          // build ridges / cliffs once (object reuse)
+void drawMountainScene(const AnimState& s);   // sky, ranges, valley, village, foreground mountain
 
 #endif

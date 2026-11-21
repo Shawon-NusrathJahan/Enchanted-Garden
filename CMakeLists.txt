@@ -14,6 +14,8 @@ find_package(glm CONFIG REQUIRED)
 add_executable(EnchantedGarden
     src/main.cpp
     src/mountain.cpp
+    src/village.cpp
+    src/garden.cpp
     src/animation.cpp
 )
 
