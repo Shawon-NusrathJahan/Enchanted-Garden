@@ -48,13 +48,15 @@ static void recompute()
 
     // Parallax: the camera drifts slowly sideways over the whole panorama and
     // re-centres while the journey starts. Layers shift by (-camX * depth).
-    const float driftBase = gfx::lerpf(-0.14f, 0.14f, smoothstep(t / 10.0f));
-    const float driftFade = 1.0f - smoothstep((t - 9.0f) / 4.0f);
+    const float driftBase = gfx::lerpf(-0.12f, 0.12f, smoothstep(t / 11.0f));
+    const float driftFade = 1.0f - smoothstep((t - 10.0f) / 4.0f);
     state.camX = driftBase * driftFade;
 
     // Stage 3: forward journey, scale grows exponentially (constant zoom feel).
     state.travel = smoothstep((t - (float)JOURNEY_START) / (float)(LIVING_START - JOURNEY_START));
-    state.zoom   = std::pow(ZOOM_MAX, state.travel);
+    // A slow forward glide (1.0 -> 1.3) runs through the whole panorama, then the
+    // journey takes over, so the camera never stops moving.
+    state.zoom   = (1.0f + 0.12f * smoothstep(t / 11.0f)) * std::pow(ZOOM_MAX, state.travel);
 
     state.shake = 0.0f;
 

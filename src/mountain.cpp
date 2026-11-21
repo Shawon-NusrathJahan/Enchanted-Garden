@@ -19,178 +19,117 @@ namespace
 // f = 0 is infinitely far away, f = 1 is the village, f > 1 is in front of it.
 // ---------------------------------------------------------------------------
 const float PX = 0.0f, PY = -0.09f;
-const float PARALLAX = 2.2f;
+const float PARALLAX = 1.0f;
 
 const float F_SKY    = 0.04f;
-const float F_FAR0   = 0.06f;     // snowy giants
+const float F_FAR0   = 0.06f;     // snowy giants (full width backdrop)
 const float F_FAR_A  = 0.12f;     // blue alpine ridge
-const float F_FAR_B  = 0.22f;     // grey-violet rocky crags
+const float F_FAR_B  = 0.22f;     // grey-violet crags
 const float F_MID    = 0.34f;     // green rounded mountains
 const float F_HILLS  = 0.55f;     // forested hills
-const float F_VEIL2  = 0.66f;     // big near mountains that hide the village at first
-const float F_VEIL1  = 0.80f;     // front forest ridge
 const float F_VALLEY = 1.00f;
-const float F_CLIFF  = 1.60f;     // hillsides framing the shot
-
-const float VEIL2_DROP = 1.8f;    // how far the near ridges slide down (screen units)
-const float VEIL1_DROP = 2.0f;
-
-const float APEX_X     = 0.75f;   // inner top of each framing hillside
-const float HILL_SLOPE = 0.45f;   // inner diagonal: d = (top0 - y) * slope
 
 struct Pine { float x, y, h, phase; };
 
-Ridge far0, farA, farB, midR, hillsR, veil2R, veil1R, valleyTop;
-std::vector<Pine> midPines, hillPines, veil2Pines, veil1Pines, valleyPinesBack, valleyPinesFront;
+// Mood: 0 = grey, misty, overcast (opening)  ..  1 = warm and sunny
+float gMood = 1.0f;
+Color P(const Color& moody, const Color& sunny) { return mix(moody, sunny, gMood); }
 
-// One framing hillside, stored in "outward distance" d from its inner top so
-// the left and right sides share the same code (sign = -1 / +1).
-struct CliffHalf
+Ridge far0, farA, farB, midR, hillsR, valleyTop;
+std::vector<Pine> midPines, hillPines, valleyPinesBack, valleyPinesFront;
+
+// ---------------------------------------------------------------------------
+// Massifs: whole mountains that sit in front of the village. They come in
+// left/right pairs. At the start each pair is closed in the middle; during the
+// reveal every left mountain slides left and every right one slides right
+// (nearer pairs travel further), opening a gap that shows the village.
+// ---------------------------------------------------------------------------
+struct Massif
 {
-    float sign, L, top0;
-    std::vector<float> d, top;
-    std::vector<float> faceY, faceIn, faceOut;
-    std::vector<std::vector<std::pair<float, float>>> cracks;
-    std::vector<Pine> trees, rim;
+    float cx, dir, f, slide, span, base, snowY;   // snowY < 0 : no snow
+    int   kind;                                   // 0 alpine, 1 rocky green, 2 forest
+    bool  fall;
+    float fallX;
+    Ridge r;
+    std::vector<Pine> pines;
 };
-CliffHalf cliffL, cliffR;
+std::vector<Massif> massifs;
 
-float edgeAt(float y, float top0) { return (top0 - y) * HILL_SLOPE; }
-float lowAt(float d, float top0)  { return std::max(top0 - d / HILL_SLOPE, -2.4f); }
-
-float topAt(const CliffHalf& c, float d)
+Massif makeMassif(float cx, float dir, float f, float slide, float base, float snowY, int kind,
+                  const std::vector<PeakDef>& peaks, float seed, float rough, float treeLine, int nPines)
 {
-    float f = clampf(d / c.L * (c.d.size() - 1), 0.0f, (float)c.d.size() - 1.001f);
-    const int i = (int)f;
-    return lerpf(c.top[i], c.top[i + 1], f - i);
+    Massif m;
+    m.cx = cx; m.dir = dir; m.f = f; m.slide = slide; m.base = base; m.snowY = snowY; m.kind = kind;
+    m.span = 1.90f; m.fall = false; m.fallX = 0.0f;
+    m.r = makePeakRidge(-m.span, m.span, 0.02f, base, peaks, seed, rough, false);
+    // foothills: both ends sink smoothly below the bottom of the picture
+    for (size_t i = 0; i < m.r.x.size(); i++)
+    {
+        const float x = m.r.x[i];
+        const float inner = dir < 0.0f ? (m.span - x) : (x + m.span);      // distance to the end facing the centre
+        const float k = smoothstep(clampf(inner / 0.95f, 0.0f, 1.0f));
+        m.r.y[i] = lerpf(-1.3f, m.r.y[i], k);
+    }
+    for (int i = 0; i < nPines; i++)
+    {
+        const float x  = -m.span * 0.90f + 2.0f * m.span * 0.90f * hash1(i * 7.13f + seed);
+        const float yh = std::min(ridgeAt(m.r, x) - 0.04f, treeLine);
+        const float yl = std::max(-1.05f, yh - 0.65f);
+        if (yh < -1.0f) continue;
+        const float y  = lerpf(yl, yh, std::pow(hash1(i * 3.91f + seed * 2.0f), 0.8f));
+        const float h  = (0.045f + 0.045f * hash1(i * 5.5f + seed)) * (0.55f + f) + 0.10f * (yh - y);
+        m.pines.push_back({x, y, h, hash1(i * 1.3f + seed)});
+    }
+    std::stable_sort(m.pines.begin(), m.pines.end(), [](const Pine& a, const Pine& b) { return a.y > b.y; });
+    return m;
 }
 
-CliffHalf makeCliff(float sign, float seed)
+// Animated waterfall running down a mountain flank (local massif coordinates).
+void drawFall(float x, float yTop, float yEnd, float width, float t, float seed)
 {
-    CliffHalf c;
-    c.sign = sign;
-    c.L    = WORLD_W + 0.9f;
+    const int N = 40;
+    auto cxAt = [&](float y) { return x + 0.012f * std::sin(y * 14.0f + seed); };
+    auto wd   = [&](float y) { return width * (0.55f + 0.9f * (yTop - y) / (yTop - yEnd)); };
 
-    const int N = 100;
+    glBegin(GL_TRIANGLE_STRIP);
     for (int i = 0; i <= N; i++)
     {
-        const float u = (float)i / N;
-        const float y = 0.10f + 0.42f * std::pow(u, 0.85f) + 0.030f * std::sin(11.0f * u + seed) +
-                        0.020f * std::sin(27.0f * u + seed * 2.0f) + 0.010f * std::sin(63.0f * u + seed * 3.0f);
-        c.d.push_back(u * c.L);
-        c.top.push_back(y);
+        const float y = lerpf(yTop, yEnd, (float)i / N);
+        const float a = (0.60f + 0.25f * std::sin(y * 28.0f - t * 8.0f)) * smoothstep(0.0f, 0.05f, yTop - y);
+        vtx(rgb(0.95f, 0.98f, 1.0f, a), cxAt(y) - wd(y) * 0.5f, y);
+        vtx(rgb(0.95f, 0.98f, 1.0f, a), cxAt(y) + wd(y) * 0.5f, y);
     }
-    c.top0 = c.top[0];
-
-    const int M = 26;
-    for (int j = 0; j <= M; j++)
+    glEnd();
+    for (int k = 0; k < 5; k++)
     {
-        const float y   = c.top0 - 0.002f - 0.75f * j / M;
-        const float jag = 0.02f + 0.07f * hash1(j * 3.7f + seed);
-        c.faceY.push_back(y);
-        c.faceIn.push_back(edgeAt(y, c.top0) - 0.02f - jag);
-        c.faceOut.push_back(edgeAt(y, c.top0) + 0.34f + 0.14f * hash1(j * 1.9f + seed * 5.0f));
-    }
-
-    for (int k = 0; k < 6; k++)
-    {
-        std::vector<std::pair<float, float>> crack;
-        float y = c.top0 - 0.04f - 0.12f * hash1(k * 2.1f + seed);
-        float off = 0.05f + 0.20f * hash1(k * 5.3f + seed);
-        for (int p = 0; p < 4; p++)
+        glBegin(GL_QUAD_STRIP);
+        for (int i = 0; i <= N; i++)
         {
-            crack.push_back({edgeAt(y, c.top0) + off, y});
-            off += (hash1(k * 9.1f + p + seed) - 0.5f) * 0.05f;
-            y -= 0.07f + 0.08f * hash1(k * 4.4f + p * 1.3f);
-        }
-        c.cracks.push_back(crack);
-    }
-
-    for (int i = 0; i < 150; i++)
-    {
-        const float d  = 1.95f * std::pow(hash1(i * 7.13f + seed), 1.2f);
-        const float yb = lowAt(d, c.top0), yt = topAt(c, d) - 0.04f;
-        if (yt - yb < 0.08f) continue;
-        const float y = lerpf(yb + 0.02f, yt, hash1(i * 3.91f + seed * 2.0f));
-        const float depth = clampf((yt - y) / 1.0f, 0.0f, 1.0f);
-        c.trees.push_back({d, y, 0.08f + 0.08f * hash1(i * 5.5f + seed) + 0.10f * depth, hash1(i * 1.3f)});
-    }
-    std::stable_sort(c.trees.begin(), c.trees.end(), [](const Pine& a, const Pine& b) { return a.y > b.y; });
-
-    for (float d = 0.45f; d < c.L - 0.05f; d += 0.22f + 0.15f * hash1(d * 17.0f + seed))
-        c.rim.push_back({d, topAt(c, d) - 0.02f, 0.17f + 0.12f * hash1(d * 5.0f + seed), hash1(d * 3.0f)});
-    return c;
-}
-
-void drawCliff(const CliffHalf& c, float t)
-{
-    const float s = c.sign;
-    const int   n = (int)c.d.size();
-
-    for (int band = 0; band < 2; band++)
-    {
-        glBegin(GL_TRIANGLE_STRIP);
-        for (int i = 0; i < n; i++)
-        {
-            const float y    = c.top[i];
-            const float ybot = lowAt(c.d[i], c.top0);
-            const float y1   = std::max(y - 0.35f, ybot);
-            const float ya = band == 0 ? y : y1;
-            const float yb = band == 0 ? y1 : ybot;
-            const Color ca = band == 0 ? rgb(0.44f, 0.72f, 0.28f) : rgb(0.19f, 0.44f, 0.25f);
-            const Color cb = band == 0 ? rgb(0.19f, 0.44f, 0.25f) : rgb(0.05f, 0.20f, 0.17f);
-            vtx(ca, s * c.d[i], ya);
-            vtx(cb, s * c.d[i], yb);
+            const float y = lerpf(yTop, yEnd, (float)i / N);
+            const float a = clampf(std::sin(y * 22.0f - t * 11.0f + k * 2.1f), 0.0f, 1.0f) * 0.8f;
+            const float xx = cxAt(y) + (k - 2.0f) / 5.0f * wd(y);
+            vtx(rgb(1.0f, 1.0f, 1.0f, a), xx - 0.003f, y);
+            vtx(rgb(1.0f, 1.0f, 1.0f, a), xx + 0.003f, y);
         }
         glEnd();
     }
-    glBegin(GL_TRIANGLE_STRIP);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < 6; i++)                                      // spray at the foot
     {
-        vtx(rgb(0.72f, 0.90f, 0.38f), s * c.d[i], c.top[i]);
-        vtx(rgb(0.46f, 0.76f, 0.30f), s * c.d[i], c.top[i] - 0.05f - 0.02f * std::sin(c.d[i] * 38.0f));
+        const float p = fract(t * 0.25f + i / 6.0f);
+        glow(x + (i - 2.5f) * 0.03f * (0.5f + p), yEnd + 0.02f + p * 0.22f, (0.07f + 0.16f * p) * (0.5f + width * 6.0f),
+             rgb(1.0f, 1.0f, 1.0f, 0.5f * (1.0f - p)), 20);
     }
-    glEnd();
-
-    const int m = (int)c.faceY.size();
-    glBegin(GL_TRIANGLE_STRIP);
-    for (int j = 0; j < m; j++)
-    {
-        const float band = 0.90f + 0.10f * hash1(j * 7.7f + s);
-        const float dark = 1.0f - 0.30f * (float)j / m;
-        vtx(shade(rgb(0.70f, 0.80f, 0.88f), band * dark), s * c.faceIn[j], c.faceY[j]);
-        vtx(shade(rgb(0.30f, 0.42f, 0.56f), band * dark), s * c.faceOut[j], c.faceY[j]);
-    }
-    glEnd();
-    glLineWidth(2.0f);
-    setColor(rgb(0.14f, 0.20f, 0.30f, 0.75f));
-    for (const auto& crack : c.cracks)
-    {
-        glBegin(GL_LINE_STRIP);
-        for (const auto& p : crack) glVertex2f(s * p.first, p.second);
-        glEnd();
-    }
-    glLineWidth(3.0f);
-    setColor(rgb(0.08f, 0.12f, 0.20f, 0.9f));
-    glBegin(GL_LINE_STRIP);
-    for (int j = 0; j < m; j++) glVertex2f(s * c.faceIn[j], c.faceY[j]);
-    glEnd();
-    glLineWidth(1.0f);
-
-    for (const Pine& p : c.trees)
-        drawPine(s * p.x, p.y, p.h, 0.010f * std::sin(t * 1.1f + p.phase * 6.0f), 0.55f + 0.35f * p.phase);
-    for (const Pine& p : c.rim)
-        drawPine(s * p.x, p.y, p.h, 0.012f * std::sin(t * 1.1f + p.phase * 6.0f), 0.95f);
 }
+
 
 // ---------------------------------------------------------------------------
 // Layer helpers
 // ---------------------------------------------------------------------------
-void beginLayer(float f, const AnimState& s, float slideDown = 0.0f)
+void beginLayer(float f, const AnimState& s)
 {
     const float scale = 1.0f + (s.zoom - 1.0f) * f;
     const float panX  = -s.camX * f * PARALLAX;
-    const float panY  = -PY * f * s.travel - slideDown;    // journey brings the village to centre
+    const float panY  = -PY * f * s.travel;          // journey brings the village to centre
     pushCamera(scale, PX, PY, panX, panY);
 }
 
@@ -198,6 +137,25 @@ float wrap(float v, float lo, float hi)
 {
     const float w = hi - lo;
     return lo + std::fmod(std::fmod(v - lo, w) + w, w);
+}
+
+// Soft drifting fog band: overlapping flat ellipses that fade out at the rim.
+void drawMist(float y, float thick, float alpha, float t, float speed, float seed)
+{
+    const float a = alpha * (1.0f + 0.7f * (1.0f - gMood));          // foggier while moody
+    for (int i = 0; i < 6; i++)
+    {
+        const float cx = wrap(-2.8f + i * 1.1f + speed * t + seed * 0.7f, -3.2f, 3.2f);
+        const float cy = y + 0.03f * std::sin(t * 0.3f + i * 1.9f + seed);
+        const float rx = 0.9f + 0.3f * hash1(i * 3.3f + seed);
+        glBegin(GL_TRIANGLE_FAN);
+        glColor4f(0.95f, 0.97f, 0.98f, clampf(a, 0.0f, 0.9f));
+        glVertex2f(cx, cy);
+        glColor4f(0.95f, 0.97f, 0.98f, 0.0f);
+        for (int k = 0; k <= 24; k++)
+            glVertex2f(cx + std::cos(TAU * k / 24) * rx, cy + std::sin(TAU * k / 24) * thick);
+        glEnd();
+    }
 }
 
 void drawPines(const std::vector<Pine>& list, float t, float dark)
@@ -212,20 +170,24 @@ void drawPines(const std::vector<Pine>& list, float t, float dark)
 // ---------------------------------------------------------------------------
 void drawSky(float t)
 {
-    static const Stop stops[] = {
-        {-1.6f, rgb(0.99f, 0.90f, 0.82f)}, {-0.1f, rgb(0.99f, 0.90f, 0.82f)}, {0.12f, rgb(0.80f, 0.89f, 0.96f)},
-        {0.45f, rgb(0.50f, 0.74f, 0.94f)}, {0.80f, rgb(0.28f, 0.52f, 0.88f)}, {1.60f, rgb(0.13f, 0.30f, 0.68f)},
-        {2.40f, rgb(0.13f, 0.30f, 0.68f)}};
+    const Stop stops[] = {
+        {-1.6f, P(rgb(0.94f, 0.95f, 0.95f), rgb(0.99f, 0.90f, 0.82f))},
+        {-0.1f, P(rgb(0.94f, 0.95f, 0.95f), rgb(0.99f, 0.90f, 0.82f))},
+        {0.12f, P(rgb(0.88f, 0.92f, 0.94f), rgb(0.80f, 0.89f, 0.96f))},
+        {0.45f, P(rgb(0.76f, 0.84f, 0.90f), rgb(0.50f, 0.74f, 0.94f))},
+        {0.80f, P(rgb(0.62f, 0.72f, 0.82f), rgb(0.28f, 0.52f, 0.88f))},
+        {1.60f, P(rgb(0.52f, 0.63f, 0.76f), rgb(0.13f, 0.30f, 0.68f))},
+        {2.40f, P(rgb(0.52f, 0.63f, 0.76f), rgb(0.13f, 0.30f, 0.68f))}};
     vGradient(-3.2f, 3.2f, stops, 7);
 
-    glow(0.10f, 0.28f, 1.35f, rgb(1.0f, 0.88f, 0.70f, 0.85f), 48);
-    glow(0.10f, 0.28f, 0.50f, rgb(1.0f, 0.96f, 0.85f, 0.9f), 40);
+    glow(0.10f, 0.28f, 1.35f, P(rgb(1.0f, 1.0f, 1.0f, 0.55f), rgb(1.0f, 0.88f, 0.70f, 0.85f)), 48);
+    glow(0.10f, 0.28f, 0.50f, P(rgb(1.0f, 1.0f, 1.0f, 0.55f), rgb(1.0f, 0.96f, 0.85f, 0.9f)), 40);
 
     struct C { float x, y, s, speed, pink; };
     static const C clouds[] = {{-1.30f, 0.84f, 0.85f, 0.010f, 0.85f}, {1.35f, 0.84f, 0.95f, 0.007f, 0.80f},
                                {0.15f, 0.86f, 0.45f, 0.012f, 0.55f},  {-0.55f, 0.90f, 0.35f, 0.015f, 0.40f},
                                {0.80f, 0.90f, 0.38f, 0.009f, 0.45f}};
-    for (const C& c : clouds) drawCloud(wrap(c.x + c.speed * t, -3.2f, 3.2f), c.y, c.s, c.pink);
+    for (const C& c : clouds) drawCloud(wrap(c.x + c.speed * t, -3.2f, 3.2f), c.y, c.s, c.pink * gMood, 0.75f + 0.25f * gMood);
 
     for (int i = 0; i < 5; i++)
     {
@@ -237,6 +199,31 @@ void drawSky(float t)
 
 void drawValley(float t, const AnimState& s)
 {
+    // turquoise lake behind the village (the ground below covers its lower half)
+    {
+        const float cx = 0.10f, cy = 0.10f;
+        setColor(P(rgb(0.40f, 0.52f, 0.46f), rgb(0.55f, 0.72f, 0.56f)));
+        ellipse(cx, cy, 1.02f, 0.125f, 48);                                  // shore
+        setColor(P(rgb(0.16f, 0.58f, 0.62f), rgb(0.22f, 0.72f, 0.76f)));
+        ellipse(cx, cy, 0.97f, 0.112f, 48);
+        setColor(P(rgb(0.50f, 0.82f, 0.82f, 0.55f), rgb(0.60f, 0.90f, 0.88f, 0.55f)));
+        ellipse(cx, cy + 0.04f, 0.80f, 0.055f, 48);
+        setColor(rgb(1.0f, 1.0f, 1.0f, 0.35f));                              // pale reflection wedge
+        tri(0.45f, cy + 0.10f, 0.20f, cy - 0.02f, 0.70f, cy - 0.02f);
+        for (int k = 0; k < 9; k++)                                           // shimmer
+        {
+            const float x = cx - 0.75f + k * 0.19f + 0.04f * std::sin(t * 0.9f + k);
+            setColor(rgb(1.0f, 1.0f, 1.0f, 0.22f + 0.18f * std::sin(t * 1.3f + k * 1.7f)));
+            ellipse(x, cy + 0.03f * std::sin(k * 2.0f), 0.07f, 0.004f, 10);
+        }
+        drawMist(cy - 0.01f, 0.05f, 0.18f, t, 0.02f, 9.0f);
+        for (int k = 0; k < 16; k++)                                          // pines on the far shore
+        {
+            const float a = PI * (0.08f + 0.84f * k / 15.0f);
+            drawPine(cx + 1.0f * std::cos(a), cy + 0.12f * std::sin(a) - 0.015f, 0.05f + 0.03f * hash1(k * 2.0f), 0.0f, 0.8f);
+        }
+    }
+
     drawRidge(valleyTop, -1.9f, rgb(0.62f, 0.78f, 0.42f), rgb(0.20f, 0.45f, 0.22f));
 
     struct Blob { float x, y, rx, ry; Color c; };
@@ -335,55 +322,113 @@ void drawValley(float t, const AnimState& s)
             drawPine(p.x, p.y, p.h, 0.012f * std::sin(t * 1.2f + p.phase * 6.0f));
 }
 
+void drawMassif(const Massif& m, const AnimState& s, float t)
+{
+    const float slide = m.dir * m.slide * s.open;     // world units, scaled with the layer
+    beginLayer(m.f, s);
+
+    // cheap whole-mountain culling
+    const float sx0 = toScreenX(m.cx + slide - m.span), sx1 = toScreenX(m.cx + slide + m.span);
+    if (sx1 < -WORLD_W - 0.3f || sx0 > WORLD_W + 0.3f) { ++statCulled; popCamera(); return; }
+    ++statDrawn;
+
+    glPushMatrix();
+    glTranslatef(m.cx + slide, 0.0f, 0.0f);
+
+    // distance haze: far mountains melt toward the sky colour
+    const Color haze = P(rgb(0.84f, 0.88f, 0.90f), rgb(0.80f, 0.89f, 0.96f));
+    const float hz   = clampf((0.85f - m.f) * 0.70f, 0.0f, 0.6f);
+    Color cTop, cMid, cBot;
+    if (m.kind == 0)
+    {
+        cTop = P(rgb(0.52f, 0.58f, 0.66f), rgb(0.54f, 0.62f, 0.84f));
+        cMid = P(rgb(0.38f, 0.46f, 0.50f), rgb(0.40f, 0.52f, 0.62f));
+        cBot = P(rgb(0.16f, 0.32f, 0.26f), rgb(0.20f, 0.46f, 0.38f));
+    }
+    else if (m.kind == 1)
+    {
+        cTop = P(rgb(0.42f, 0.48f, 0.46f), rgb(0.52f, 0.58f, 0.54f));
+        cMid = P(rgb(0.20f, 0.36f, 0.26f), rgb(0.28f, 0.54f, 0.36f));
+        cBot = P(rgb(0.08f, 0.22f, 0.16f), rgb(0.10f, 0.32f, 0.22f));
+    }
+    else
+    {
+        cTop = P(rgb(0.32f, 0.40f, 0.34f), rgb(0.44f, 0.54f, 0.42f));
+        cMid = P(rgb(0.14f, 0.30f, 0.18f), rgb(0.20f, 0.46f, 0.26f));
+        cBot = P(rgb(0.04f, 0.14f, 0.08f), rgb(0.06f, 0.20f, 0.12f));
+    }
+    cTop = mix(cTop, haze, hz); cMid = mix(cMid, haze, hz * 0.8f); cBot = mix(cBot, haze, hz * 0.5f);
+
+    // body: rock on top, olive slope, dark forest at the foot
+    glBegin(GL_TRIANGLE_STRIP);
+    for (size_t i = 0; i < m.r.x.size(); i++)
+    {
+        const float yt = m.r.y[i];
+        vtx(cTop, m.r.x[i], yt);
+        vtx(cMid, m.r.x[i], lerpf(yt, -1.3f, 0.40f));
+    }
+    glEnd();
+    glBegin(GL_TRIANGLE_STRIP);
+    for (size_t i = 0; i < m.r.x.size(); i++)
+    {
+        const float yt = m.r.y[i];
+        vtx(cMid, m.r.x[i], lerpf(yt, -1.3f, 0.40f));
+        vtx(cBot, m.r.x[i], -1.3f);
+    }
+    glEnd();
+
+    // sunlit and shaded faces give every peak volume (profile clipped at the base so no giant wedges)
+    Ridge clipped = m.r;
+    for (float& y : clipped.y) y = std::max(y, m.base - 0.02f);
+    drawRidgeLights(clipped, mix(P(rgb(0.90f, 0.93f, 0.95f, 0.30f), rgb(1.00f, 0.95f, 0.78f, 0.38f)), withAlpha(haze, 0.25f), hz));
+    drawRidgeShadows(clipped, mix(P(rgb(0.08f, 0.14f, 0.20f, 0.55f), rgb(0.10f, 0.16f, 0.34f, 0.55f)), withAlpha(haze, 0.35f), hz * 0.7f));
+    if (m.snowY > 0.0f)
+        drawSnow(m.r, m.snowY, rgb(1.0f, 1.0f, 1.0f), P(rgb(0.86f, 0.91f, 0.96f), rgb(0.88f, 0.92f, 1.0f)));
+    if (m.kind != 2)
+        drawRockStreaks(m.r, mix(P(rgb(0.08f, 0.12f, 0.18f, 0.35f), rgb(0.14f, 0.20f, 0.36f, 0.32f)), withAlpha(haze, 0.2f), hz), m.base + 0.25f);
+
+    // forest: scattered pines, bigger and darker toward the foot
+    const float pd = 0.60f + 0.35f * hz;
+    for (const Pine& p : m.pines)
+        if (visible(p.x + m.cx + slide, p.y + p.h * 0.5f, p.h * 0.5f))
+            drawPine(p.x, p.y, p.h, 0.006f * std::sin(t * 1.1f + p.phase * 6.0f), pd + 0.3f * p.phase);
+
+    if (m.fall) drawFall(m.fallX, ridgeAt(m.r, m.fallX) - 0.10f, ridgeAt(m.r, m.fallX) - 0.62f, 0.05f, t, m.fallX * 7.0f);
+
+    glPopMatrix();
+    popCamera();
+}
+
+
 }   // namespace
 
 // ---------------------------------------------------------------------------
 void initMountain()
 {
-    // 1) snowy alpine giants, very pale and far away
     far0 = makePeakRidge(-3.0f, 3.0f, 0.02f, 0.10f,
                          {{-2.3f, 0.52f, 0.65f}, {-1.45f, 0.68f, 0.60f}, {-0.55f, 0.56f, 0.55f},
                           {0.35f, 0.74f, 0.65f}, {1.30f, 0.60f, 0.60f}, {2.25f, 0.54f, 0.65f}},
                          2.1f, 0.05f, false);
-
-    // 2) sharp blue ridge   3) grey-violet rocky crags
     farA = makeRidge(-3.0f, 3.0f, 0.02f, 0.10f, 0.52f, 1.3f, 2.4f);
     farB = makePeakRidge(-3.0f, 3.0f, 0.02f, 0.04f,
                          {{-2.5f, 0.40f, 0.42f}, {-1.7f, 0.50f, 0.40f}, {-0.9f, 0.34f, 0.45f}, {-0.1f, 0.46f, 0.38f},
                           {0.7f, 0.52f, 0.42f}, {1.6f, 0.38f, 0.45f}, {2.4f, 0.48f, 0.42f}},
                          5.7f, 0.07f, false);
-
-    // 4) green rounded mountains with pine texture
     midR = makePeakRidge(-3.0f, 3.0f, 0.02f, 0.00f,
                          {{-2.3f, 0.40f, 0.75f}, {-1.1f, 0.33f, 0.65f}, {0.0f, 0.28f, 0.60f},
                           {1.2f, 0.42f, 0.75f}, {2.4f, 0.35f, 0.70f}},
                          3.3f, 0.04f, true);
-
     hillsR    = makeRidge(-3.0f, 3.0f, 0.02f, -0.02f, 0.24f, 2.2f, 5.5f);
     valleyTop = makeRolling(-3.0f, 3.0f, 0.02f, 0.00f, 0.07f, 1.1f, 2.8f);
-
-    // 5) big near mountains (they hide the village at the start)
-    veil2R = makePeakRidge(-3.0f, 3.0f, 0.02f, 0.26f,
-                           {{-1.9f, 0.32f, 0.85f}, {-0.6f, 0.22f, 0.75f}, {0.5f, 0.34f, 0.80f}, {1.7f, 0.26f, 0.85f}},
-                           8.9f, 0.05f, false);
-    veil1R = makeRolling(-3.0f, 3.0f, 0.02f, 0.18f, 0.22f, 4.4f, 3.1f);
 
     auto scatter = [](std::vector<Pine>& out, const Ridge& r, float step, float hMin, float hVar, float dy, float seed)
     {
         for (float x = -2.9f; x < 2.9f; x += step * (0.6f + 0.8f * hash1(x * 31.7f + seed)))
             out.push_back({x, ridgeAt(r, x) - dy - 0.02f * hash1(x * 5.1f), hMin + hVar * hash1(x * 7.3f + seed), hash1(x * 3.1f)});
     };
-    midPines.clear(); hillPines.clear(); veil2Pines.clear(); veil1Pines.clear();
+    midPines.clear(); hillPines.clear();
     scatter(midPines, midR, 0.05f, 0.035f, 0.035f, 0.010f, 1.0f);
     scatter(hillPines, hillsR, 0.04f, 0.055f, 0.055f, 0.015f, 2.0f);
-    scatter(veil2Pines, veil2R, 0.06f, 0.07f, 0.06f, 0.010f, 3.0f);
-    // forest slope: rows from the crest downward, bigger trees lower on the screen
-    for (int row = 0; row < 7; row++)
-    {
-        const float dy = 0.02f + 0.17f * row;
-        scatter(veil1Pines, veil1R, 0.10f - 0.006f * row, 0.12f + 0.025f * row, 0.08f + 0.02f * row, dy, 4.0f + row);
-    }
-    std::stable_sort(veil1Pines.begin(), veil1Pines.end(), [](const Pine& a, const Pine& b) { return a.y > b.y; });
 
     valleyPinesBack = {{-1.00f, -0.10f, 0.12f, 0.1f}, {-0.84f, -0.08f, 0.10f, 0.4f}, {0.90f, -0.10f, 0.12f, 0.7f},
                        {0.76f, -0.07f, 0.10f, 0.2f},  {-0.70f, -0.06f, 0.11f, 0.9f}, {0.72f, -0.05f, 0.11f, 0.5f},
@@ -395,8 +440,30 @@ void initMountain()
                         {0.70f, -0.20f, 0.11f, 0.6f},  {0.88f, -0.52f, 0.25f, 0.3f},  {0.64f, -0.18f, 0.10f, 0.1f},
                         {1.15f, -0.27f, 0.17f, 0.4f},  {1.22f, -0.58f, 0.27f, 0.7f}};
 
-    cliffL = makeCliff(-1.0f, 1.7f);
-    cliffR = makeCliff(+1.0f, 4.9f);
+    // Three depths of mountain pairs. Far pairs move little, near pairs a lot.
+    massifs.clear();
+    // far: tall snowy alpine peaks
+    massifs.push_back(makeMassif(-0.5f, -1.0f, 0.35f, 2.2f, -0.05f, 0.55f, 0,
+        {{-0.95f, 0.88f, 0.42f}, {-0.30f, 0.98f, 0.50f}, {0.35f, 0.80f, 0.40f}, {0.95f, 0.66f, 0.45f}, {-0.55f, 0.60f, 0.35f}},
+        2.4f, 0.07f, 0.20f, 70));
+    massifs.push_back(makeMassif(0.5f, 1.0f, 0.35f, 2.2f, -0.05f, 0.55f, 0,
+        {{-0.95f, 0.70f, 0.45f}, {-0.25f, 0.90f, 0.50f}, {0.45f, 0.98f, 0.42f}, {1.00f, 0.78f, 0.40f}, {0.10f, 0.55f, 0.35f}},
+        5.1f, 0.07f, 0.20f, 70));
+    // mid: rocky green mountains
+    massifs.push_back(makeMassif(-0.5f, -1.0f, 0.55f, 2.7f, -0.25f, -1.0f, 1,
+        {{-0.90f, 0.62f, 0.50f}, {-0.20f, 0.78f, 0.52f}, {0.45f, 0.70f, 0.48f}, {0.95f, 0.52f, 0.40f}},
+        7.7f, 0.06f, 0.30f, 110));
+    massifs.back().fall = true; massifs.back().fallX = -0.18f;
+    massifs.push_back(makeMassif(0.5f, 1.0f, 0.55f, 2.7f, -0.25f, -1.0f, 1,
+        {{-0.95f, 0.54f, 0.42f}, {-0.30f, 0.72f, 0.50f}, {0.35f, 0.82f, 0.52f}, {0.95f, 0.64f, 0.48f}},
+        3.9f, 0.06f, 0.30f, 110));
+    // near: forest-covered mountains
+    massifs.push_back(makeMassif(-0.5f, -1.0f, 0.80f, 3.3f, -0.52f, -1.0f, 2,
+        {{-0.85f, 0.68f, 0.55f}, {-0.15f, 0.82f, 0.60f}, {0.50f, 0.74f, 0.52f}, {0.95f, 0.62f, 0.50f}},
+        8.9f, 0.05f, 0.05f, 150));
+    massifs.push_back(makeMassif(0.5f, 1.0f, 0.80f, 3.3f, -0.52f, -1.0f, 2,
+        {{-0.95f, 0.66f, 0.50f}, {-0.35f, 0.76f, 0.58f}, {0.25f, 0.84f, 0.60f}, {0.90f, 0.70f, 0.55f}},
+        6.3f, 0.05f, 0.05f, 150));
 
     initVillage();
 }
@@ -404,94 +471,63 @@ void initMountain()
 void drawMountainScene(const AnimState& s)
 {
     const float t = (float)s.time;
+    gMood = smoothstep((t - 4.0f) / 9.0f);               // grey & misty -> warm & sunny
 
-    // sky, warm glow, clouds, birds
     beginLayer(F_SKY, s);
     drawSky(t);
     popCamera();
 
-    // snowy giants (pale, lilac)
     beginLayer(F_FAR0, s);
-    drawRidge(far0, -0.6f, rgb(0.60f, 0.66f, 0.90f), rgb(0.86f, 0.91f, 0.99f));
+    drawRidge(far0, -0.6f, P(rgb(0.60f, 0.67f, 0.76f), rgb(0.60f, 0.66f, 0.90f)), P(rgb(0.86f, 0.90f, 0.93f), rgb(0.86f, 0.91f, 0.99f)));
     drawRidgeLights(far0, rgb(0.95f, 0.97f, 1.00f, 0.35f));
-    drawSnow(far0, 0.46f, rgb(1.00f, 1.00f, 1.00f), rgb(0.86f, 0.90f, 1.00f));
-    drawRidgeShadows(far0, rgb(0.46f, 0.52f, 0.82f, 0.50f));
+    drawSnow(far0, 0.46f, rgb(1.00f, 1.00f, 1.00f), P(rgb(0.88f, 0.92f, 0.96f), rgb(0.86f, 0.90f, 1.00f)));
+    drawRidgeShadows(far0, P(rgb(0.42f, 0.50f, 0.62f, 0.50f), rgb(0.46f, 0.52f, 0.82f, 0.50f)));
+    drawMist(0.30f, 0.10f, 0.30f, t, 0.012f, 1.0f);
     popCamera();
 
-    // blue alpine ridge
     beginLayer(F_FAR_A, s);
-    drawRidge(farA, -0.6f, rgb(0.46f, 0.66f, 0.88f), rgb(0.80f, 0.89f, 0.96f));
+    drawRidge(farA, -0.6f, P(rgb(0.44f, 0.56f, 0.64f), rgb(0.46f, 0.66f, 0.88f)), P(rgb(0.80f, 0.86f, 0.89f), rgb(0.80f, 0.89f, 0.96f)));
     drawRidgeLights(farA, rgb(0.86f, 0.93f, 1.00f, 0.30f));
-    drawRidgeShadows(farA, rgb(0.34f, 0.54f, 0.80f, 0.55f));
+    drawRidgeShadows(farA, P(rgb(0.30f, 0.42f, 0.54f, 0.55f), rgb(0.34f, 0.54f, 0.80f, 0.55f)));
+    drawMist(0.20f, 0.09f, 0.30f, t, -0.015f, 2.0f);
     popCamera();
 
-    // grey-violet rocky crags with gullies
     beginLayer(F_FAR_B, s);
-    drawRidge(farB, -0.6f, rgb(0.42f, 0.50f, 0.72f), rgb(0.72f, 0.80f, 0.92f));
+    drawRidge(farB, -0.6f, P(rgb(0.34f, 0.44f, 0.50f), rgb(0.42f, 0.50f, 0.72f)), P(rgb(0.70f, 0.77f, 0.80f), rgb(0.72f, 0.80f, 0.92f)));
     drawRidgeLights(farB, rgb(0.84f, 0.88f, 0.98f, 0.30f));
-    drawRidgeShadows(farB, rgb(0.20f, 0.28f, 0.58f, 0.55f));
-    drawRockStreaks(farB, rgb(0.18f, 0.24f, 0.50f, 0.30f), 0.22f);
+    drawRidgeShadows(farB, P(rgb(0.14f, 0.22f, 0.30f, 0.55f), rgb(0.20f, 0.28f, 0.58f, 0.55f)));
+    drawRockStreaks(farB, P(rgb(0.10f, 0.16f, 0.22f, 0.35f), rgb(0.18f, 0.24f, 0.50f, 0.30f)), 0.22f);
+    drawMist(0.12f, 0.09f, 0.34f, t, 0.02f, 3.0f);
     popCamera();
 
-    // green rounded mountains covered in pines
     beginLayer(F_MID, s);
-    drawRidge(midR, -0.7f, rgb(0.18f, 0.50f, 0.38f), rgb(0.52f, 0.76f, 0.66f));
-    drawRidgeLights(midR, rgb(0.62f, 0.88f, 0.52f, 0.40f));
-    drawRidgeShadows(midR, rgb(0.05f, 0.28f, 0.30f, 0.55f));
-    drawPines(midPines, t, 0.75f);
+    drawRidge(midR, -0.7f, P(rgb(0.12f, 0.30f, 0.24f), rgb(0.18f, 0.50f, 0.38f)), P(rgb(0.50f, 0.62f, 0.58f), rgb(0.52f, 0.76f, 0.66f)));
+    drawRidgeLights(midR, P(rgb(0.62f, 0.72f, 0.34f, 0.35f), rgb(0.62f, 0.88f, 0.52f, 0.40f)));
+    drawRidgeShadows(midR, rgb(0.03f, 0.20f, 0.22f, 0.55f));
+    drawPines(midPines, t, 0.70f);
+    drawMist(0.06f, 0.08f, 0.38f, t, -0.02f, 4.0f);
     popCamera();
 
-    // forested hills + valley mist
     beginLayer(F_HILLS, s);
-    drawRidge(hillsR, -0.8f, rgb(0.16f, 0.48f, 0.36f), rgb(0.38f, 0.68f, 0.46f));
-    drawRidgeLights(hillsR, rgb(0.62f, 0.86f, 0.50f, 0.30f));
-    drawRidgeShadows(hillsR, rgb(0.05f, 0.28f, 0.28f, 0.55f));
-    drawPines(hillPines, t, 0.80f);
-    rectV(-3.0f, -0.05f, 3.0f, 0.28f, rgb(1.0f, 0.95f, 0.88f, 0.42f), rgb(1.0f, 0.95f, 0.88f, 0.0f));
+    drawRidge(hillsR, -0.8f, P(rgb(0.10f, 0.28f, 0.17f), rgb(0.16f, 0.48f, 0.36f)), P(rgb(0.30f, 0.46f, 0.28f), rgb(0.38f, 0.68f, 0.46f)));
+    drawRidgeLights(hillsR, P(rgb(0.66f, 0.72f, 0.28f, 0.32f), rgb(0.62f, 0.86f, 0.50f, 0.30f)));
+    drawRidgeShadows(hillsR, rgb(0.03f, 0.20f, 0.20f, 0.55f));
+    drawPines(hillPines, t, 0.75f);
     popCamera();
 
-    // valley floor, river, road, village
     beginLayer(F_VALLEY, s);
     drawValley(t, s);
     popCamera();
 
-    // near mountains that hide the village at first and slide down to reveal it
-    if (s.open < 0.999f)
+    // mountain pairs, far -> near; drifting mist between the depths
+    for (size_t i = 0; i < massifs.size(); i++)
     {
-        beginLayer(F_VEIL2, s, VEIL2_DROP * s.open);
-        drawRidge(veil2R, -1.0f, rgb(0.10f, 0.38f, 0.38f), rgb(0.26f, 0.56f, 0.48f));
-        drawRidgeLights(veil2R, rgb(0.58f, 0.84f, 0.55f, 0.35f));
-        drawRidgeShadows(veil2R, rgb(0.02f, 0.20f, 0.26f, 0.60f));
-        drawRockStreaks(veil2R, rgb(0.02f, 0.18f, 0.24f, 0.30f), 0.40f);
-        drawPines(veil2Pines, t, 0.70f);
-        popCamera();
-
-        beginLayer(F_VEIL1, s, VEIL1_DROP * s.open);
-        drawRidge(veil1R, -1.6f, rgb(0.30f, 0.60f, 0.30f), rgb(0.05f, 0.22f, 0.16f));
-        drawPines(veil1Pines, t, 0.75f);
-        popCamera();
+        drawMassif(massifs[i], s, t);
+        if (i % 2 == 1 && s.open < 0.98f)
+        {
+            beginLayer(massifs[i].f, s);
+            drawMist(massifs[i].base + 0.10f, 0.07f, 0.20f * (1.0f - s.open), t, 0.02f * (i % 4 ? 1 : -1), 6.0f + (float)i);
+            popCamera();
+        }
     }
-
-    // framing hillsides (forest + rock outcrop), as in the reference picture
-    beginLayer(F_CLIFF, s);
-    if (toScreenX(-APEX_X + 0.12f) > -WORLD_W - 0.1f)
-    {
-        glPushMatrix();
-        glTranslatef(-APEX_X, 0.0f, 0.0f);
-        drawCliff(cliffL, t);
-        glPopMatrix();
-        ++statDrawn;
-    }
-    else ++statCulled;
-
-    if (toScreenX(APEX_X - 0.12f) < WORLD_W + 0.1f)
-    {
-        glPushMatrix();
-        glTranslatef(APEX_X, 0.0f, 0.0f);
-        drawCliff(cliffR, t);
-        glPopMatrix();
-        ++statDrawn;
-    }
-    else ++statCulled;
-    popCamera();
 }

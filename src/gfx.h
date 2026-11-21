@@ -93,7 +93,7 @@ inline bool visible(float x, float y, float r)
 {
     const float sx = toScreenX(x), sy = toScreenY(y), sr = r * layer.s;
     const bool  v  = !cullingEnabled ||
-                     (std::fabs(sx) - sr < WORLD_W + 0.05f && std::fabs(sy) - sr < 1.05f);
+                     (std::fabs(sx) - sr < WORLD_W + 0.30f && std::fabs(sy) - sr < 1.30f);
     if (v) ++statDrawn; else ++statCulled;
     return v;
 }
